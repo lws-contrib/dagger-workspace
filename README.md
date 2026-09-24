@@ -31,3 +31,25 @@ Expose a service to the host:
 dagger call lws-server-service up --ports 8080:8080
 dagger call sparq-service up --ports 3000:3000
 ```
+
+## GitHub Actions
+
+[`.github/workflows/dagger.yml`](.github/workflows/dagger.yml) runs the
+conformance suites in CI with the `dagger/dagger-for-github@v8.3.0` action
+(engine v0.21.9):
+
+- runs on every push, and manually via **workflow_dispatch**
+- executes a 2×2 matrix: `touchstone`/`lws-net` × `lws-server`/`sparq`, each
+  cell passing or failing independently (`fail-fast: false`)
+- the lws-net cells default to the canonical manifests from git HEAD of
+  `lws-contrib/lws-test-suite`
+
+Manual (`workflow_dispatch`) runs accept an optional **local manifests copy**
+instead of the remote default — the lws-test-suite repo is checked out on the
+runner as `./lws-test-suite` and the suites are invoked with
+`--manifests`:
+
+- `manifests_repo` — repo to check out (default `lws-contrib/lws-test-suite`)
+- `manifests_ref` — branch/ref (default branch if empty)
+- `manifests_path` — relative path from the workspace root to the `lws10`
+  tree, e.g. `lws-test-suite/lws10` (leave empty to use the remote default)
