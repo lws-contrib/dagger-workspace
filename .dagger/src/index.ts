@@ -109,7 +109,12 @@ export class DaggerWorkspace {
   /**
    * Builds the Touchstone conformance harness image, following the same recipe
    * as its Dockerfile: Maven-wrapper build on JDK 21, then a slim JRE runtime
-   * carrying the shaded CLI jar plus the catalog and manifests.
+   * carrying the shaded CLI jar plus the requirements catalog and the YAML-LD
+   * test definitions (catalog/ and definitions/ at the repo root).
+   *
+   * Touchstone vendors its own lws10 definitions for now; it does not consume
+   * the canonical manifests from lws-contrib/lws-test-suite yet (a future
+   * change will wire --manifests into this path as well).
    */
   private touchstoneImage(source?: Directory): Container {
     const src = this.touchstoneSource(source)
@@ -130,7 +135,7 @@ export class DaggerWorkspace {
       .withWorkdir("/opt/touchstone")
       .withFile("touchstone.jar", build.file("/src/harness-cli/target/touchstone.jar"))
       .withDirectory("catalog", src.directory("catalog"))
-      .withDirectory("manifests", src.directory("manifests"))
+      .withDirectory("definitions", src.directory("definitions"))
   }
 
   /**
@@ -166,7 +171,7 @@ export class DaggerWorkspace {
         "--targets", "/work/targets.yaml",
         "--report-dir", "/work/runs",
         "--catalog", "catalog",
-        "--manifests", "manifests",
+        "--definitions", "definitions",
       ])
       .stdout()
   }
@@ -220,9 +225,11 @@ export class DaggerWorkspace {
     source?: Directory,
     // Override the harness source (touchstone / LWS.net repo checkout).
     suite?: Directory,
-    // Override the lws10 manifest tree (lws-net only; default: git HEAD of
+    // Override the lws10 manifest tree (default: git HEAD of
     // https://github.com/lws-contrib/lws-test-suite). Pass a relative path to
     // a local checkout (e.g. ../lws-test-suite/lws10) to force a local copy.
+    // Only the lws-net harness consumes these today; touchstone still vendors
+    // its own definitions/ and will pick this up in a future change.
     manifests?: Directory,
   ): Promise<string> {
     const { service, host, baseUrl } = this.sut(server, source)
