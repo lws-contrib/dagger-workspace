@@ -1,0 +1,9 @@
+{
+  "name": "definitions",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ttl2yaml": "bun .dagger/ttl-to-yaml.ts",
+    "yaml2ttl": "bun .dagger/yaml-to-ttl.ts"
+  }
+}

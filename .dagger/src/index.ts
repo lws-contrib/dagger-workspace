@@ -7,12 +7,13 @@
  * the Touchstone (https://github.com/ebremer/touchstone) or LWS.net
  * (https://github.com/langsamu/LWS.net) conformance harnesses against them.
  *
- * The canonical lws10/ test manifests are taken from git HEAD of
- * https://github.com/lws-contrib/lws-test-suite by default. Pass a relative
- * path to a local checkout (e.g. --manifests ../lws-test-suite/lws10) to
- * force use of a local copy instead.
+ * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
+ * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
+ * default (converted to N-Triples and mounted as the harness's new.ttl).
+ * Pass a relative path to a local checkout (e.g. --tests ../lws-test-suite/lws10)
+ * to force use of a local copy instead.
  */
-import { dag, Container, Directory, object, func, Service } from "@dagger.io/dagger"
+import { dag, Container, Directory, File, object, func, Service } from "@dagger.io/dagger"
 
 @object()
 export class DaggerWorkspace {
@@ -44,16 +45,19 @@ export class DaggerWorkspace {
   }
 
   /**
-   * The canonical lws10/ manifest tree: git HEAD of the canonical
-   * https://github.com/lws-contrib/lws-test-suite repo by default, or a local
-   * copy when an explicit Directory is passed (e.g. a relative path to a
-   * checkout of the lws-test-suite repo). Never the stale copy embedded in
-   * the LWS.net repo.
+   * The lws-net suite definition: tests.yaml from the `yaml` branch of
+   * https://github.com/elf-pavlik/lws-test-suite by default (the same
+   * YAML-LD shape produced by `bun run ttl2yaml` in this workspace), or a
+   * local copy when an explicit Directory is passed (e.g. a relative path to
+   * a checkout of the lws-test-suite repo).
    */
-  private lws10Manifests(manifests?: Directory): Directory {
+  private lwsNetTests(tests?: Directory): Directory {
     return (
-      manifests ??
-      dag.git("https://github.com/lws-contrib/lws-test-suite").head().tree().directory("lws10")
+      tests ??
+      dag.git("https://github.com/elf-pavlik/lws-test-suite")
+        .branch("yaml")
+        .tree()
+        .directory("lws10")
     )
   }
 
@@ -210,10 +214,11 @@ export class DaggerWorkspace {
    *   dagger call test --harness touchstone --server sparq
    *   dagger call test --harness lws-net --server sparq
    *
-   * The lws-net harness uses the canonical manifests from git HEAD of
-   * https://github.com/lws-contrib/lws-test-suite by default; force a local
-   * copy by passing a relative path:
-   *   dagger call test --harness lws-net --server lws-server --manifests ../lws-test-suite/lws10
+   * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
+   * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
+   * default (converted to N-Triples and mounted as the harness's new.ttl);
+   * force a local copy by passing a relative path:
+   *   dagger call test --harness lws-net --server lws-server --tests ../lws-test-suite/lws10
    */
   @func()
   async test(
@@ -225,19 +230,19 @@ export class DaggerWorkspace {
     source?: Directory,
     // Override the harness source (touchstone / LWS.net repo checkout).
     suite?: Directory,
-    // Override the lws10 manifest tree (default: git HEAD of
-    // https://github.com/lws-contrib/lws-test-suite). Pass a relative path to
-    // a local checkout (e.g. ../lws-test-suite/lws10) to force a local copy.
-    // Only the lws-net harness consumes these today; touchstone still vendors
-    // its own definitions/ and will pick this up in a future change.
-    manifests?: Directory,
+    // Suite definition for the lws-net harness: default is tests.yaml from
+    // the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite
+    // (converted to N-Triples new.ttl); pass a relative path to a local
+    // checkout of the lws-test-suite repo to force a local copy instead.
+    // Touchstone still vendors its own definitions/ and does not consume this.
+    tests?: Directory,
   ): Promise<string> {
     const { service, host, baseUrl } = this.sut(server, source)
     if (harness === "touchstone") {
       return this.touchstoneRun(service, host, baseUrl, suite)
     }
     if (harness === "lws-net") {
-      return this.lwsNetSuite(suite, manifests)
+      return this.lwsNetSuite(suite, tests)
         .withServiceBinding(host, service)
         .withEnvVariable("Suite__BaseUri", baseUrl)
         .withExec(["dotnet", "test", "Suite/Test"])
@@ -247,38 +252,40 @@ export class DaggerWorkspace {
   }
 
   /**
-   * Builds the LWS.net suite container with NON-stale manifests: the canonical
-   * lws10/ tree (git HEAD of https://github.com/lws-contrib/lws-test-suite, or
-   * an explicitly passed local copy) is copied into the suite's embedded
-   * Resources before compilation (dash -> underscore, the mapping Resources.cs
-   * applies at lookup), so the stale copy checked into the LWS.net repo can
-   * never be used.
+   * Converts the YAML-LD suite definition (tests.yaml) to N-Triples Turtle
+   * and returns it as a dagger File, ready to be embedded as the harness's
+   * new.ttl. Runs this workspace's yaml-to-ttl.ts with bun (oven/bun image),
+   * installing the pinned deps (package.json + bun.lock).
    */
-  private lwsNetSuite(suite?: Directory, manifests?: Directory): Container {
-    const manifestsSync =
-      "set -e; " +
-      "rm -rf /src/Suite/Model/Resources; " +
-      "mkdir -p /src/Suite/Model/Resources; " +
-      "cp -r /manifests/containers /manifests/context.jsonld /manifests/linksets " +
-      "/manifests/manifest.jsonld /manifests/resources /manifests/mnt " +
-      "/src/Suite/Model/Resources/; " +
-      // The canonical root manifest includes auth/*/manifest.jsonld files that
-      // do not exist yet in lws10 (the generated auth manifests live under
-      // mnt/user-data/outputs/lws-tests/...); relink those includes, exactly
-      // like the suite's own vendored copy did (content stays canonical).
-      "sed -E -i '" +
-      "s#\"auth/(did[-_]key|oidc|saml)/manifest.jsonld\"#" +
-      "\"mnt/user-data/outputs/lws-tests/auth/\\1/manifest.jsonld\"#g' " +
-      "/src/Suite/Model/Resources/manifest.jsonld; " +
-      "find /src/Suite/Model/Resources -depth -name '*-*' | while read -r p; do " +
-      "  mv \"$p\" \"$(dirname \"$p\")/$(basename \"$p\" | tr - _)\"; done"
+  private lwsNetDefinitionTtl(tests?: Directory): File {
+    const work = dag
+      .container()
+      .from("oven/bun:1")
+      .withEntrypoint([]) // the oven/bun image defaults its entrypoint to bun
+      .withDirectory("/work", dag.currentModule().source()) // module files: package.json, bun.lock, yaml-to-ttl.ts
+      .withFile("/work/tests.yaml", this.lwsNetTests(tests).file("tests.yaml"))
+      .withWorkdir("/work")
+      .withExec(["bun", "install", "--frozen-lockfile"])
+      .withExec(["bun", "yaml-to-ttl.ts", "tests.yaml", "new.ttl"])
+    return work.file("/work/new.ttl")
+  }
+
+  /**
+   * Builds the LWS.net suite container with the suite definition mounted
+   * under the harness's fixed embedded resource name (Resources/new.ttl): the
+   * external YAML-LD definition is converted to N-Triples first (see
+   * lwsNetDefinitionTtl) so the harness keeps parsing Turtle with no changes.
+   */
+  private lwsNetSuite(suite?: Directory, tests?: Directory): Container {
     return dag
       .container()
       .from("mcr.microsoft.com/dotnet/sdk:10.0")
       .withDirectory("/src", this.lwsNetSource(suite))
-      .withDirectory("/manifests", this.lws10Manifests(manifests))
+      .withFile(
+        "/src/Suite/Model/Resources/new.ttl",
+        this.lwsNetDefinitionTtl(tests),
+      )
       .withWorkdir("/src")
-      .withExec(["sh", "-c", manifestsSync])
   }
 
   /**

@@ -4,27 +4,27 @@ on:
   # Run on pushes to any branch (remove when narrowing to specific branches).
   push:
   # Allow running manually from the Actions tab. For manual runs you can force
-  # the suites to use a local checkout of the canonical lws10/ manifests
-  # (instead of the default git HEAD of lws-contrib/lws-test-suite) by setting
-  # manifests_path, e.g. "lws-test-suite/lws10".
+  # the suites to use a local checkout of the lws10/ test definitions
+  # (instead of the default tests.yaml from the `yaml` branch of
+  # elf-pavlik/lws-test-suite) by setting tests_path, e.g. "lws-test-suite/lws10".
   workflow_dispatch:
     inputs:
-      manifests_path:
+      tests_path:
         description: >-
-          Force use of a local copy of the lws10/ manifests by passing a
-          relative path (from the workspace root) to them, e.g.
-          "lws-test-suite/lws10". The manifests repo is checked out on the
+          Force use of a local copy of the lws10/ test definitions by passing
+          a relative path (from the workspace root) to them, e.g.
+          "lws-test-suite/lws10". The tests repo is checked out on the
           runner as ./lws-test-suite. Leave empty to use the remote default.
         required: false
         default: ""
-      manifests_repo:
-        description: Repository to check out for the local manifests copy.
+      tests_repo:
+        description: Repository to check out for the local tests copy.
         required: false
-        default: lws-contrib/lws-test-suite
-      manifests_ref:
-        description: Branch/ref of the manifests repo (default branch if empty).
+        default: elf-pavlik/lws-test-suite
+      tests_ref:
+        description: Branch/ref of the tests repo (default branch if empty).
         required: false
-        default: ""
+        default: yaml
 
 jobs:
   conformance:
@@ -46,16 +46,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Optional: used only for manual runs that force a local manifests copy
-      # (manifests_path input). Checked out at ./lws-test-suite so that a
+      # Optional: used only for manual runs that force a local tests copy
+      # (tests_path input). Checked out at ./lws-test-suite so that a
       # relative path like "lws-test-suite/lws10" resolves from the workspace
-      # root when passed to --manifests below.
-      - name: Checkout local manifests (optional)
-        if: inputs.manifests_path != ''
+      # root when passed to --tests below.
+      - name: Checkout local tests (optional)
+        if: inputs.tests_path != ''
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.manifests_repo }}
-          ref: ${{ inputs.manifests_ref }}
+          repository: ${{ inputs.tests_repo }}
+          ref: ${{ inputs.tests_ref }}
           path: lws-test-suite
 
       - name: Run suite
@@ -67,9 +67,9 @@ jobs:
           # Single line on purpose: this action version writes `args` into
           # GITHUB_OUTPUT, whose format rejects embedded newlines — a multiline
           # `args: |` makes every job fail with "Invalid format ...".
-          # The trailing expression appends "--manifests <path>" only when a
-          # local manifests path is provided for a manual run.
-          args: test --harness ${{ matrix.harness }} --server ${{ matrix.server }}${{ inputs.manifests_path != '' && format(' --manifests {0}', inputs.manifests_path) || '' }}
+          # The trailing expression appends "--tests <path>" only when a
+          # local tests path is provided for a manual run.
+          args: test --harness ${{ matrix.harness }} --server ${{ matrix.server }}${{ inputs.tests_path != '' && format(' --tests {0}', inputs.tests_path) || '' }}
           # Optional: send traces to Dagger Cloud. Add a repository secret
           # named DAGGER_CLOUD_TOKEN and uncomment:
           # cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
