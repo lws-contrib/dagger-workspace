@@ -25,6 +25,17 @@ on:
         description: Branch/ref of the tests repo (default branch if empty).
         required: false
         default: yaml
+      halcyon_repo:
+        description: >-
+          GitHub repository to build the Halcyon server cell from instead of
+          halcyon-project/Halcyon (e.g. a fork or patch branch). Ignored for
+          the other server cells.
+        required: false
+        default: halcyon-project/Halcyon
+      halcyon_ref:
+        description: Branch/ref of halcyon_repo; defaults to next.
+        required: false
+        default: next
 
 jobs:
   conformance:
@@ -37,11 +48,13 @@ jobs:
       matrix:
         harness: [touchstone, lws-net]
         server: [lws-server, sparq, halcyon]
-        # The lws-net x sparq cell is currently red (Solid vs LWS surface), as
-        # are both halcyon cells: the LWS.net harness never sends an
-        # Authorization header, so Halcyon (ACP; anonymous never granted)
-        # answers 401 to every request, and the touchstone cell is red until
-        # Halcyon-next's surface matches the suite the harness reads.
+        # The lws-net x sparq cell is currently red (Solid vs LWS surface). The
+        # halcyon cells boot differently per harness: touchstone keeps the
+        # ACP-enforcing storage seeded with LWS-OIDC owner credentials (see
+        # README), while lws-net boots the DEV-ONLY :LWSOpenMode seed (a public
+        # root ACR policy) so its anonymous requests — it sends no Authorization
+        # header — can provision the storage. Both are expected to move as the
+        # server's surface converges with the suite the harness reads.
         # Uncomment to drop a cell from the run until it conforms:
         # exclude:
         #   - harness: lws-net
@@ -75,7 +88,7 @@ jobs:
           # `args: |` makes every job fail with "Invalid format ...".
           # The trailing expression appends "--tests <path>" only when a
           # local tests path is provided for a manual run.
-          args: test --harness ${{ matrix.harness }} --server ${{ matrix.server }}${{ inputs.tests_path != '' && format(' --tests {0}', inputs.tests_path) || '' }}
+          args: test --harness ${{ matrix.harness }} --server ${{ matrix.server }}${{ inputs.tests_path != '' && format(' --tests {0}', inputs.tests_path) || '' }}${{ inputs.halcyon_repo != '' && format(' --halcyon-repo {0}', inputs.halcyon_repo) || '' }}${{ inputs.halcyon_ref != '' && format(' --halcyon-ref {0}', inputs.halcyon_ref) || '' }}
           # Optional: send traces to Dagger Cloud. Add a repository secret
           # named DAGGER_CLOUD_TOKEN and uncomment:
           # cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}

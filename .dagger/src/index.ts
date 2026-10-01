@@ -18,6 +18,7 @@
 import { dag, Container, Directory, File, object, func, Service } from "@dagger.io/dagger"
 import { Buffer } from "node:buffer"
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto"
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml"
 
 // ---------------------------------------------------------------------------
 // Halcyon LWS-OIDC fixtures
@@ -132,17 +133,22 @@ function derToRaw(der: Buffer): Buffer {
   return Buffer.concat([to32(r), to32(s)])
 }
 
-const HALCYON_SETTINGS_TTL =
-  "PREFIX :    <https://halcyon.is/ns/>\n" +
-  "PREFIX lws: <https://www.w3.org/ns/lws#>\n" +
-  "<http://localhost> a :HalcyonSettingsFile ;\n" +
-  '    :ProxyHostName "http://halcyon:8888" ;\n' +
-  "    :HTTPPort 8888 ;\n" +
-  '    :RDFStoreLocation "tdb2" ;\n' +
-  '    :LWSStoreLocation "lws-tdb2" ;\n' +
-  `    :LWSOwner <${HALCYON_ALICE_WEBID}> ;\n` +
-  "    :hasLWSStorage [ a lws:Storage ; :urlPath \"/W3Clws\" ;\n" +
-  "                     :storageRoot <file:///data/lws/W3Clws/> ; :namingPolicy \"uuid\" ] .\n"
+/** settings.ttl for the Halcyon service; `openMode` adds the DEV-ONLY public seed. */
+function renderHalcyonSettings(openMode: boolean): string {
+  return (
+    "PREFIX :    <https://halcyon.is/ns/>\n" +
+    "PREFIX lws: <https://www.w3.org/ns/lws#>\n" +
+    "<http://localhost> a :HalcyonSettingsFile ;\n" +
+    '    :ProxyHostName "http://halcyon:8888" ;\n' +
+    "    :HTTPPort 8888 ;\n" +
+    '    :RDFStoreLocation "tdb2" ;\n' +
+    '    :LWSStoreLocation "lws-tdb2" ;\n' +
+    `    :LWSOwner <${HALCYON_ALICE_WEBID}> ;\n` +
+    (openMode ? "    :LWSOpenMode true ;\n" : "") +
+    "    :hasLWSStorage [ a lws:Storage ; :urlPath \"/W3Clws\" ;\n" +
+    "                     :storageRoot <file:///data/lws/W3Clws/> ; :namingPolicy \"uuid\" ] .\n"
+  )
+}
 
 const HALCYON_LWS_OIDC_JSON =
   "{\n  \"enabled\": true,\n  \"allowedInternalHosts\": [\"127.0.0.1\"]\n}\n"
@@ -213,13 +219,23 @@ export class DaggerWorkspace {
 
   /**
    * The Halcyon source: the `next` branch of
-   * https://github.com/halcyon-project/Halcyon by default, or a local checkout
-   * when a source Directory is passed explicitly.
+   * https://github.com/halcyon-project/Halcyon by default (or another GitHub
+   * repo/branch via halcyonRepo/halcyonRef), or a local checkout when a source
+   * Directory is passed explicitly.
    */
-  private halcyonSource(source?: Directory): Directory {
+  private halcyonSource(
+    source?: Directory,
+    halcyonRepo?: string,
+    halcyonRef?: string,
+  ): Directory {
     return (
       source ??
-      dag.git("https://github.com/halcyon-project/Halcyon").branch("next").tree()
+      dag
+        .git(halcyonRepo && halcyonRepo.trim() !== ""
+          ? halcyonRepo
+          : "https://github.com/halcyon-project/Halcyon")
+        .branch(halcyonRef && halcyonRef.trim() !== "" ? halcyonRef : "next")
+        .tree()
     )
   }
 
@@ -305,6 +321,35 @@ export class DaggerWorkspace {
   }
 
   /**
+   * The lws-net suite resolves the storage root as the SITE root: each test GETs
+   * `{baseUri}/` (a relative "/"), which the harness's Uri.Evaluate resolves
+   * against the configured base — so the storage must live at the host root for
+   * that to hit the storage description. lws-server and sparq are mounted there;
+   * Halcyon mounts its storage at a path (/W3Clws), where resolving "/" lands
+   * on the Wicket home page (HTML, which the JsonPath extractor rejects). For
+   * the halcyon cell only, rewrite that relative root to "" so the request
+   * resolves to the base itself — the storage root URI, which serves the
+   * description (lws10-core: "the storage URI answers with its description").
+   */
+  private async halcyonLwsNetTests(tests?: Directory): Promise<Directory> {
+    const src = this.lwsNetTests(tests)
+    const doc = parseYaml(await src.file("tests.yaml").contents()) as {
+      tests?: Array<{
+        steps?: Array<{ request?: { uri?: { relative?: { value?: string } } } }>
+      }>
+    }
+    for (const t of doc.tests ?? []) {
+      for (const step of t.steps ?? []) {
+        const relative = step.request?.uri?.relative
+        if (relative?.value === "/") {
+          relative.value = "" // resolves to the storage root URI (the base)
+        }
+      }
+    }
+    return dag.directory().withNewFile("tests.yaml", stringifyYaml(doc))
+  }
+
+  /**
    * Runs the Touchstone conformance harness against a bound service.
    *
    * The harness container registers the service as the SUT target in a
@@ -354,7 +399,10 @@ export class DaggerWorkspace {
    */
   private sut(
     server: string,
+    harness: string,
     source?: Directory,
+    halcyonRepo?: string,
+    halcyonRef?: string,
   ): {
     service: Service
     host: string
@@ -362,11 +410,22 @@ export class DaggerWorkspace {
     targetProperties?: Record<string, string>
   } {
     if (server === "halcyon") {
-      // Halcyon enforces authentication, so the touchstone target registry
-      // carries static LWS-OIDC credentials (webid + ID token) for alice and
-      // bob, minted against the in-container OIDC fixture (see HALCYON_OIDC).
+      // lws-net never sends an Authorization header, so its cell boots Halcyon
+      // in DEV-ONLY open mode (:LWSOpenMode): the seeded root ACR grants the
+      // public agent full control, and anonymous requests provision the
+      // storage. The touchstone cell keeps the closed posture and its harness
+      // reads static LWS-OIDC credentials (webid + ID token) for alice and bob
+      // from the target registry — minted against the in-container OIDC fixture
+      // (see HALCYON_OIDC) — while the owner policy stays the controller.
+      if (harness === "lws-net") {
+        return {
+          service: this.halcyonService(source, true, halcyonRepo, halcyonRef),
+          host: "halcyon",
+          baseUrl: "http://halcyon:8888/W3Clws/",
+        }
+      }
       return {
-        service: this.halcyonService(source),
+        service: this.halcyonService(source, false, halcyonRepo, halcyonRef),
         host: "halcyon",
         baseUrl: "http://halcyon:8888/W3Clws/",
         targetProperties: {
@@ -422,6 +481,11 @@ export class DaggerWorkspace {
     server: string = "lws-server",
     // Override the implementation source (local checkout of the server).
     source?: Directory,
+    // Halcyon only: the GitHub repo to build from when no local --source is
+    // given (default: halcyon-project/Halcyon). e.g. a fork or patch branch.
+    halcyonRepo?: string,
+    // Halcyon only: the branch/ref of halcyonRepo (default: next).
+    halcyonRef?: string,
     // Override the harness source (touchstone / LWS.net repo checkout).
     suite?: Directory,
     // Suite definition for the lws-net harness: default is tests.yaml from
@@ -431,12 +495,17 @@ export class DaggerWorkspace {
     // Touchstone still vendors its own definitions/ and does not consume this.
     tests?: Directory,
   ): Promise<string> {
-    const { service, host, baseUrl, targetProperties } = this.sut(server, source)
+    const { service, host, baseUrl, targetProperties } =
+      this.sut(server, harness, source, halcyonRepo, halcyonRef)
     if (harness === "touchstone") {
       return this.touchstoneRun(service, host, baseUrl, targetProperties, suite)
     }
     if (harness === "lws-net") {
-      return this.lwsNetSuite(suite, tests)
+      // The halcyon cell serves its storage at a path, so its suite must resolve
+      // relative "/" to the storage root itself (see halcyonLwsNetTests).
+      const suiteTests =
+        server === "halcyon" ? await this.halcyonLwsNetTests(tests) : tests
+      return this.lwsNetSuite(suite, suiteTests)
         .withServiceBinding(host, service)
         .withEnvVariable("Suite__BaseUri", baseUrl)
         .withExec(["dotnet", "test", "Suite/Test"])
@@ -510,17 +579,30 @@ export class DaggerWorkspace {
    * Authentication uses the embedded lws10-authn-openid fixture: the
    * OidcServer + lws-oidc.json + the minted ID tokens this module generates
    * (see HALCYON_OIDC), so the touchstone harness can present bearer
-   * credentials. The LWS.net harness sends none, so that cell is expected red.
+   * credentials. In open mode (for harnesses that send none, e.g. lws-net) the
+   * storage is additionally seeded :LWSOpenMode, which grants the public agent
+   * full control on the root and descendants.
    *
    * The source defaults to the `next` branch of
    * https://github.com/halcyon-project/Halcyon; pass --source with a local
    * checkout to test uncommitted changes.
+   *
+   * @param openMode DEV/TEST ONLY: boot with :LWSOpenMode so the seeded root
+   *   ACR also grants the public agent full control (harnesses that send no
+   *   bearer token, e.g. lws-net). Implies overlaying the LWS open-mode source
+   *   patch (halcyon/patches) until it lands upstream; the touchstone cell uses
+   *   the default closed posture with LWS-OIDC credentials instead.
    */
   @func()
-  halcyonService(source?: Directory): Service {
-    const runtime = this.halcyonBuild(source)
+  halcyonService(
+    source?: Directory,
+    openMode: boolean = false,
+    halcyonRepo?: string,
+    halcyonRef?: string,
+  ): Service {
+    const runtime = this.halcyonBuild(source, openMode, halcyonRepo, halcyonRef)
       .withNewFile("/opt/halcyon/application.yml", HALCYON_APPLICATION_YML)
-      .withNewFile("/opt/halcyon/settings.ttl", HALCYON_SETTINGS_TTL)
+      .withNewFile("/opt/halcyon/settings.ttl", renderHalcyonSettings(openMode))
       .withNewFile("/opt/halcyon/lws-oidc.json", HALCYON_LWS_OIDC_JSON)
       .withFile(
         "/opt/halcyon-oidc/OidcServer.java",
@@ -559,20 +641,41 @@ export class DaggerWorkspace {
    * cache volume; the reactor's first-party artifacts (BeakGraph et al.) come
    * anonymously from the Halcyon Maven repo.
    */
-  private halcyonBuild(source?: Directory): Container {
-    return dag
+  private halcyonBuild(
+    source?: Directory,
+    openMode: boolean = false,
+    halcyonRepo?: string,
+    halcyonRef?: string,
+  ): Container {
+    let build = dag
       .container()
       .from("maven:3.9-eclipse-temurin-25")
       .withMountedCache("/root/.m2/repository", dag.cacheVolume("halcyon-m2"))
-      .withDirectory("/src", this.halcyonSource(source))
+      .withDirectory("/src", this.halcyonSource(source, halcyonRepo, halcyonRef))
       .withWorkdir("/src")
-      .withExec([
-        "sh",
-        "-c",
-        "mkdir -p /opt && " +
-          "mvn -q -B -ntp -Dmaven.test.skip=true -pl Halcyon -am package && " +
-          "cp Halcyon/target/Halcyon-*.jar /opt/halcyon.jar",
-      ])
+    if (openMode) {
+      // :LWSOpenMode is not on halcyon-project/Halcyon next yet, so overlay the
+      // patched files (copies of the local-clone edits in ebremer/Halcyon) to
+      // make the lws-net cell work against the plain remote tree. Remove once
+      // the patch is merged upstream.
+      const patch = dag.currentModule().source().directory("halcyon/patches")
+      build = build
+        .withFile(
+          "/src/HalcyonLWS/src/main/java/com/ebremer/lws/acp/AcpBootstrap.java",
+          patch.file("AcpBootstrap.java"),
+        )
+        .withFile(
+          "/src/HalcyonLWS/src/main/java/com/ebremer/lws/config/LwsSettings.java",
+          patch.file("LwsSettings.java"),
+        )
+    }
+    return build.withExec([
+      "sh",
+      "-c",
+      "mkdir -p /opt && " +
+        "mvn -q -B -ntp -Dmaven.test.skip=true -pl Halcyon -am package && " +
+        "cp Halcyon/target/Halcyon-*.jar /opt/halcyon.jar",
+    ])
   }
 
   @func()

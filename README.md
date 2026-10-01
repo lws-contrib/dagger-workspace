@@ -42,23 +42,41 @@ dagger call halcyon-service up --ports 8888:8888
 ## Notes on Halcyon
 
 Halcyon targets the `next` branch of
-[halcyon-project/Halcyon](https://github.com/halcyon-project/Halcyon). Two things
-make it different from the open-mode servers (`lws-server`, `sparq`):
+[halcyon-project/Halcyon](https://github.com/halcyon-project/Halcyon) and enforces
+authentication (ACP): every storage needs a `:LWSOwner` and anonymous is never
+granted. The two harness cells therefore boot the server in different postures:
 
-- **It enforces authentication.** Every storage needs a `:LWSOwner` and anonymous
-  is never granted, so the harnesses must present bearer credentials. The module
-  wires Halcyon's native `lws10-authn-openid` suite with a minimal in-container
-  OIDC fixture (WebID CIDs + discovery + JWKS served on the container's
-  loopback, `lws-oidc.json` allow-listing it, and ES256 ID tokens for `alice`
-  and `bob` minted at graph-build time). Touchstone picks these up from the
-  target registry as `token.alice`/`token.bob`/`webid.*` properties.
-- **The LWS.net harness sends no `Authorization` header**, so its requests are
-  anonymous and Halcyon answers them `401` — the `lws-net x halcyon` cell is
-  red for that reason, like `lws-net x sparq`. The touchstone cell is the
-  meaningful one.
+- **touchstone** — closed, with owner credentials. A minimal in-container OIDC
+  fixture wires Halcyon's native `lws10-authn-openid` suite (WebID CIDs +
+  discovery + JWKS served on the container's loopback, `lws-oidc.json`
+  allow-listing it, and ES256 ID tokens for `alice` and `bob` minted at
+  graph-build time). Touchstone reads them from the target registry as
+  `token.alice`/`token.bob`/`webid.*` properties, and the seeded root ACR
+  grants `alice` full control as owner.
+- **lws-net** — DEV-ONLY open mode, since that harness sends no `Authorization`
+  header. The module boots Halcyon with `:LWSOpenMode true`, the analogue of
+  sparq's `SOLID_SERVER_OPEN_MODE` dev seed (which lives on the repo's
+  `feat/open-mode` branch): the seeded root ACR additionally grants the
+  **public agent** Read/Write/Append/Control on the root and every descendant,
+  so anonymous requests can provision and write. Until `:LWSOpenMode` lands
+  upstream, the module overlays the two patched Halcyon files
+  (`.dagger/halcyon/patches/`, copies of the edits in `ebremer/Halcyon`) onto
+  the source at build time; once merged, the overlay can be deleted. One more
+  thing differs for that cell: the lws-net suite resolves the storage root as
+  the **site root** (`GET {baseUri}/`), which is true for lws-server/sparq but
+  not for a storage mounted at a path, so the module rewrites that relative
+  root to `""` for Halcyon — the request then resolves to the storage root
+  itself, which serves the description.
+
+Whether a cell is green is a conformance question and expected to move; the
+`lws-net x sparq` cell is red for reference.
 
 `dagger call test --server halcyon --source ../ebremer/Halcyon` runs the local
-checkout (any branch), which is how uncommitted changes are tested.
+checkout (any branch), which is how uncommitted changes are tested. On CI (and
+anywhere `--source` is absent) the Halcyon cells build from a GitHub repo
+instead: `--halcyon-repo` (default `halcyon-project/Halcyon`) and `--halcyon-ref`
+(default `next`) select the branch, e.g. `--halcyon-repo elf-pavlik/Halcyon
+--halcyon-ref open-mode` for a fork containing the patch.
 
 ## GitHub Actions
 
@@ -84,3 +102,10 @@ runner as `./lws-test-suite` and the suites are invoked with
 - `tests_ref` — branch/ref (default `yaml`)
 - `tests_path` — relative path from the workspace root to the `lws10`
   tree, e.g. `lws-test-suite/lws10` (leave empty to use the remote default)
+
+Manual runs can also steer the Halcyon server cells (ignored for the other
+servers):
+
+- `halcyon_repo` — the GitHub repo to build Halcyon from (default
+  `halcyon-project/Halcyon`, e.g. a fork or patch branch)
+- `halcyon_ref` — branch/ref of `halcyon_repo` (default `next`)
