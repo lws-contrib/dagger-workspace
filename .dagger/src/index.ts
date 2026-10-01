@@ -672,9 +672,21 @@ export class DaggerWorkspace {
     return build.withExec([
       "sh",
       "-c",
+      // The Halcyon reactor resolves its first-party artifacts (BeakGraph,
+      // vandegraph, cygnus, ...) from the private Nexus cursus.bmi
+      // .stonybrookmedicine.edu, whose reads are anonymous. Under request
+      // pressure it answers 403 — Halcyon's own CI documents this (M28: "a cold
+      // full download is itself a failure mode") and mitigates with a warm
+      // ~/.m2, which a dagger CI run does not have. Retry with backoff: each
+      // attempt resumes from the same local repo, so downloaded artifacts carry
+      // over and the rate-limited window passes.
       "mkdir -p /opt && " +
-        "mvn -q -B -ntp -Dmaven.test.skip=true -pl Halcyon -am package && " +
-        "cp Halcyon/target/Halcyon-*.jar /opt/halcyon.jar",
+        "for i in 1 2 3 4 5; do " +
+        "if mvn -q -B -ntp -Daether.connector.basic.connectTimeout=60000 " +
+        "-Dmaven.test.skip=true -pl Halcyon -am package; then " +
+        "cp Halcyon/target/Halcyon-*.jar /opt/halcyon.jar && exit 0; fi; " +
+        'echo "halcyon maven build failed (attempt $i of 5); retrying in $((i * 30))s"; ' +
+        "sleep $((i * 30)); done; exit 1",
     ])
   }
 
