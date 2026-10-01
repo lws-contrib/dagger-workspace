@@ -36,12 +36,18 @@ jobs:
       fail-fast: false
       matrix:
         harness: [touchstone, lws-net]
-        server: [lws-server, sparq]
-        # The lws-net x sparq cell is currently red (Solid vs LWS surface).
-        # Uncomment to drop that cell from the run until it conforms:
+        server: [lws-server, sparq, halcyon]
+        # The lws-net x sparq cell is currently red (Solid vs LWS surface), as
+        # are both halcyon cells: the LWS.net harness never sends an
+        # Authorization header, so Halcyon (ACP; anonymous never granted)
+        # answers 401 to every request, and the touchstone cell is red until
+        # Halcyon-next's surface matches the suite the harness reads.
+        # Uncomment to drop a cell from the run until it conforms:
         # exclude:
         #   - harness: lws-net
         #     server: sparq
+        #   - harness: lws-net
+        #     server: halcyon
     steps:
       - name: Checkout
         uses: actions/checkout@v4

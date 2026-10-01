@@ -2,10 +2,12 @@
  * Dagger module for the LWS conformance workspace
  * (https://github.com/lws-contrib/dagger-workspace).
  *
- * Builds the lws-server (https://github.com/ebremer/lws-server) and sparq
- * (https://github.com/sparq-org/sparq) implementations under test and runs
- * the Touchstone (https://github.com/ebremer/touchstone) or LWS.net
- * (https://github.com/langsamu/LWS.net) conformance harnesses against them.
+ * Builds the lws-server (https://github.com/ebremer/lws-server), sparq
+ * (https://github.com/sparq-org/sparq) and Halcyon
+ * (https://github.com/halcyon-project/Halcyon, `next` branch) implementations
+ * under test and runs the Touchstone (https://github.com/ebremer/touchstone) or
+ * LWS.net (https://github.com/langsamu/LWS.net) conformance harnesses against
+ * them.
  *
  * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
  * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
@@ -14,6 +16,154 @@
  * to force use of a local copy instead.
  */
 import { dag, Container, Directory, File, object, func, Service } from "@dagger.io/dagger"
+import { Buffer } from "node:buffer"
+import { generateKeyPairSync, randomUUID, sign } from "node:crypto"
+
+// ---------------------------------------------------------------------------
+// Halcyon LWS-OIDC fixtures
+//
+// Halcyon on the `next` branch (halcyon-project/Halcyon) never grants anonymous
+// access: every storage needs a :LWSOwner in settings.ttl, and the conformance
+// harnesses must therefore present real bearer credentials. Rather than stand
+// up Keycloak, this module wires the authentication suite Halcyon implements
+// natively -- lws10-authn-openid -- with a minimal in-container OIDC fixture:
+//
+//   * an OidcServer (halcyon/oidc/OidcServer.java) serving, on the container's
+//     loopback, the controlled-identifier documents for two agents (alice, bob)
+//     and the OIDC discovery + JWKS of the OpenID Provider they nominate;
+//   * ES256 ID tokens minted here at graph-build time, signed with the same
+//     key the fixture's jwks.json publishes. They reach the harness as static
+//     tokens (token.alice / token.bob in the target registry) and Halcyon's
+//     LwsOidcVerifier via lws-oidc.json, which allow-lists the loopback host
+//     past the SSRF guard.
+//
+// The keypair is generated once per Dagger process so the jwks.json written
+// into the Halcyon container and the tokens passed to the harness always match.
+// ---------------------------------------------------------------------------
+
+const HALCYON_OIDC_HOST = "127.0.0.1:8891"
+const HALCYON_OIDC_BASE = `http://${HALCYON_OIDC_HOST}`
+const HALCYON_OIDC_KID = "halcyon-oidc-1"
+const HALCYON_ALICE_WEBID = `${HALCYON_OIDC_BASE}/alice`
+const HALCYON_BOB_WEBID = `${HALCYON_OIDC_BASE}/bob`
+
+/** The fixture keypair, and every document/token derived from it. */
+const HALCYON_OIDC = (() => {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", {
+    namedCurve: "prime256v1",
+  })
+  const jwk = publicKey.export({ format: "jwk" }) as unknown as {
+    x: string
+    y: string
+  }
+  const publicJwk = {
+    kty: "EC",
+    crv: "P-256",
+    x: jwk.x,
+    y: jwk.y,
+    kid: HALCYON_OIDC_KID,
+    alg: "ES256",
+    use: "sig",
+  }
+  const iss = HALCYON_OIDC_BASE
+  const iat = Math.floor(Date.now() / 1000)
+  // Long-lived on purpose: the tokens are minted before the Maven build, and
+  // must still be valid when the harness finally connects.
+  const exp = iat + 6 * 60 * 60
+  const mint = (sub: string): string => {
+    const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url")
+    const header = { alg: "ES256", typ: "JWT", kid: HALCYON_OIDC_KID }
+    const input = `${b64(header)}.${b64({ iss, sub, iat, exp, jti: randomUUID() })}`
+    const sig = derToRaw(sign("sha256", Buffer.from(input), privateKey))
+    return `${input}.${Buffer.from(sig).toString("base64url")}`
+  }
+  const cid = (webid: string) =>
+    JSON.stringify({
+      id: webid,
+      service: [
+        {
+          type: "https://www.w3.org/ns/lws#OpenIdProvider",
+          serviceEndpoint: iss,
+        },
+      ],
+    })
+  return {
+    discovery: JSON.stringify({
+      issuer: iss,
+      authorization_endpoint: `${iss}/authorize`,
+      token_endpoint: `${iss}/token`,
+      jwks_uri: `${iss}/jwks.json`,
+      response_types_supported: ["id_token"],
+      subject_types_supported: ["public"],
+      id_token_signing_alg_values_supported: ["ES256"],
+    }),
+    jwks: JSON.stringify({ keys: [publicJwk] }),
+    cidAlice: cid(HALCYON_ALICE_WEBID),
+    cidBob: cid(HALCYON_BOB_WEBID),
+    tokenAlice: mint(HALCYON_ALICE_WEBID),
+    tokenBob: mint(HALCYON_BOB_WEBID),
+  }
+})()
+
+/** DER ECDSA signature -> the fixed-width R||S form JWS uses. */
+function derToRaw(der: Buffer): Buffer {
+  let p = 0
+  if (der[p++] !== 0x30) {
+    throw new Error("not a DER sequence")
+  }
+  p++ // sequence length (single byte for a P-256 signature)
+  if (der[p++] !== 0x02) {
+    throw new Error("not an integer")
+  }
+  const rLen = der[p++]
+  const r = der.subarray(p, p + rLen)
+  p += rLen
+  if (der[p++] !== 0x02) {
+    throw new Error("not an integer")
+  }
+  const sLen = der[p++]
+  const s = der.subarray(p, p + sLen)
+  const to32 = (b: Buffer): Buffer => {
+    const out = Buffer.alloc(32)
+    const trim = b.length > 32 ? b.subarray(b.length - 32) : b
+    trim.copy(out, 32 - trim.length)
+    return out
+  }
+  return Buffer.concat([to32(r), to32(s)])
+}
+
+const HALCYON_SETTINGS_TTL =
+  "PREFIX :    <https://halcyon.is/ns/>\n" +
+  "PREFIX lws: <https://www.w3.org/ns/lws#>\n" +
+  "<http://localhost> a :HalcyonSettingsFile ;\n" +
+  '    :ProxyHostName "http://halcyon:8888" ;\n' +
+  "    :HTTPPort 8888 ;\n" +
+  '    :RDFStoreLocation "tdb2" ;\n' +
+  '    :LWSStoreLocation "lws-tdb2" ;\n' +
+  `    :LWSOwner <${HALCYON_ALICE_WEBID}> ;\n` +
+  "    :hasLWSStorage [ a lws:Storage ; :urlPath \"/W3Clws\" ;\n" +
+  "                     :storageRoot <file:///data/lws/W3Clws/> ; :namingPolicy \"uuid\" ] .\n"
+
+const HALCYON_LWS_OIDC_JSON =
+  "{\n  \"enabled\": true,\n  \"allowedInternalHosts\": [\"127.0.0.1\"]\n}\n"
+
+/**
+ * Replaces the jar's packaged application.yml (see the Halcyon service): the
+ * jar ships server.ssl with a JKS bundle that needs local keystore files and
+ * would force HTTPS, but the conformance harnesses speak plain HTTP, so this
+ * boot strips the SSL connector (:HTTPS2enabled is also off in settings.ttl).
+ */
+const HALCYON_APPLICATION_YML =
+  "server:\n" +
+  "  port: 8888\n" +
+  "spring:\n" +
+  "  main:\n" +
+  "    keep-alive: true\n" +
+  "    allow-circular-references: true\n" +
+  "logging:\n" +
+  "  level:\n" +
+  "    root: INFO\n" +
+  "    com.ebremer.lws: INFO\n"
 
 @object()
 export class DaggerWorkspace {
@@ -58,6 +208,18 @@ export class DaggerWorkspace {
         .branch("yaml")
         .tree()
         .directory("lws10")
+    )
+  }
+
+  /**
+   * The Halcyon source: the `next` branch of
+   * https://github.com/halcyon-project/Halcyon by default, or a local checkout
+   * when a source Directory is passed explicitly.
+   */
+  private halcyonSource(source?: Directory): Directory {
+    return (
+      source ??
+      dag.git("https://github.com/halcyon-project/Halcyon").branch("next").tree()
     )
   }
 
@@ -155,17 +317,24 @@ export class DaggerWorkspace {
     server: Service,
     alias: string,
     baseUrl: string,
+    properties?: Record<string, string>,
     touchstone?: Directory,
   ): Promise<string> {
+    let targets =
+      "targets:\n" +
+      "  sut:\n" +
+      `    baseUrl: ${baseUrl}\n` +
+      "    adapter: env\n"
+    const props = Object.entries(properties ?? {})
+    if (props.length > 0) {
+      targets += "    properties:\n"
+      for (const [k, v] of props) {
+        targets += `      ${k}: '${v}'\n`
+      }
+    }
     return this.touchstoneImage(touchstone)
       .withServiceBinding(alias, server)
-      .withNewFile(
-        "/work/targets.yaml",
-        "targets:\n" +
-          "  sut:\n" +
-          `    baseUrl: ${baseUrl}\n` +
-          "    adapter: env\n",
-      )
+      .withNewFile("/work/targets.yaml", targets)
       .withMountedCache("/work/runs", dag.cacheVolume("touchstone-runs"))
       .withExec([
         "java", "-jar", "/opt/touchstone/touchstone.jar",
@@ -186,7 +355,28 @@ export class DaggerWorkspace {
   private sut(
     server: string,
     source?: Directory,
-  ): { service: Service; host: string; baseUrl: string } {
+  ): {
+    service: Service
+    host: string
+    baseUrl: string
+    targetProperties?: Record<string, string>
+  } {
+    if (server === "halcyon") {
+      // Halcyon enforces authentication, so the touchstone target registry
+      // carries static LWS-OIDC credentials (webid + ID token) for alice and
+      // bob, minted against the in-container OIDC fixture (see HALCYON_OIDC).
+      return {
+        service: this.halcyonService(source),
+        host: "halcyon",
+        baseUrl: "http://halcyon:8888/W3Clws/",
+        targetProperties: {
+          "webid.alice": HALCYON_ALICE_WEBID,
+          "webid.bob": HALCYON_BOB_WEBID,
+          "token.alice": HALCYON_OIDC.tokenAlice,
+          "token.bob": HALCYON_OIDC.tokenBob,
+        },
+      }
+    }
     if (server === "sparq") {
       return {
         service: this.sparqService(source),
@@ -201,7 +391,9 @@ export class DaggerWorkspace {
         baseUrl: "http://lws-server:8080/",
       }
     }
-    throw new Error(`unknown server: ${server} (expected lws-server or sparq)`)
+    throw new Error(
+      `unknown server: ${server} (expected lws-server, sparq or halcyon)`,
+    )
   }
 
   /**
@@ -213,6 +405,8 @@ export class DaggerWorkspace {
    *   dagger call test --harness lws-net --server lws-server
    *   dagger call test --harness touchstone --server sparq
    *   dagger call test --harness lws-net --server sparq
+   *   dagger call test --harness touchstone --server halcyon
+   *   dagger call test --harness lws-net --server halcyon
    *
    * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
    * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
@@ -224,7 +418,7 @@ export class DaggerWorkspace {
   async test(
     // The suite harness: "touchstone" (default) or "lws-net".
     harness: string = "touchstone",
-    // The implementation under test: "lws-server" (default) or "sparq".
+    // The implementation under test: "lws-server" (default), "sparq" or "halcyon".
     server: string = "lws-server",
     // Override the implementation source (local checkout of the server).
     source?: Directory,
@@ -237,9 +431,9 @@ export class DaggerWorkspace {
     // Touchstone still vendors its own definitions/ and does not consume this.
     tests?: Directory,
   ): Promise<string> {
-    const { service, host, baseUrl } = this.sut(server, source)
+    const { service, host, baseUrl, targetProperties } = this.sut(server, source)
     if (harness === "touchstone") {
-      return this.touchstoneRun(service, host, baseUrl, suite)
+      return this.touchstoneRun(service, host, baseUrl, targetProperties, suite)
     }
     if (harness === "lws-net") {
       return this.lwsNetSuite(suite, tests)
@@ -302,6 +496,85 @@ export class DaggerWorkspace {
    * https://github.com/elf-pavlik/sparq fork; pass --source with a local checkout
    * to test uncommitted changes.
    */
+  /**
+   * Builds and starts the W3C Linked Web Storage server embedded in Halcyon
+   * (https://github.com/halcyon-project/Halcyon, `next` branch), returned as a
+   * Dagger service bound as "halcyon" on port 8888.
+   *
+   * The storage serves the LWS Protocol over plain HTTP on a single mount,
+   * /W3Clws (uuid naming), with alice (the fixture WebID) as its owner;
+   * Keycloak is off (no :AuthServer). The jar's packaged application.yml is
+   * replaced via --spring.config.location so the server.ssl JKS bundle never
+   * comes into play; :HTTPS2enabled is off in settings.ttl as well.
+   *
+   * Authentication uses the embedded lws10-authn-openid fixture: the
+   * OidcServer + lws-oidc.json + the minted ID tokens this module generates
+   * (see HALCYON_OIDC), so the touchstone harness can present bearer
+   * credentials. The LWS.net harness sends none, so that cell is expected red.
+   *
+   * The source defaults to the `next` branch of
+   * https://github.com/halcyon-project/Halcyon; pass --source with a local
+   * checkout to test uncommitted changes.
+   */
+  @func()
+  halcyonService(source?: Directory): Service {
+    const runtime = this.halcyonBuild(source)
+      .withNewFile("/opt/halcyon/application.yml", HALCYON_APPLICATION_YML)
+      .withNewFile("/opt/halcyon/settings.ttl", HALCYON_SETTINGS_TTL)
+      .withNewFile("/opt/halcyon/lws-oidc.json", HALCYON_LWS_OIDC_JSON)
+      .withFile(
+        "/opt/halcyon-oidc/OidcServer.java",
+        dag.currentModule().source().file("halcyon/oidc/OidcServer.java"),
+      )
+      .withNewFile(
+        "/opt/halcyon-oidc/www/.well-known/openid-configuration",
+        HALCYON_OIDC.discovery,
+      )
+      .withNewFile("/opt/halcyon-oidc/www/jwks.json", HALCYON_OIDC.jwks)
+      .withNewFile("/opt/halcyon-oidc/www/alice", HALCYON_OIDC.cidAlice)
+      .withNewFile("/opt/halcyon-oidc/www/bob", HALCYON_OIDC.cidBob)
+      .withExec([
+        "sh",
+        "-c",
+        "mkdir -p /data/lws/W3Clws /opt/halcyon/logs && " +
+          "javac -d /opt/halcyon-oidc /opt/halcyon-oidc/OidcServer.java",
+      ])
+    return runtime
+      .withExposedPort(8888)
+      .asService({
+        args: [
+          "sh",
+          "-c",
+          "java -cp /opt/halcyon-oidc OidcServer /opt/halcyon-oidc/www 8891 & " +
+            "sleep 2; cd /opt/halcyon && " +
+            "exec java -jar /opt/halcyon.jar --spring.config.location=file:/opt/halcyon/application.yml",
+        ],
+      })
+      .withHostname("halcyon")
+  }
+
+  /**
+   * Builds Halcyon (Maven / Spring Boot 4, JDK 25) into a container image,
+   * copying the runnable jar to /opt/halcyon.jar. Dependencies are cached in a
+   * cache volume; the reactor's first-party artifacts (BeakGraph et al.) come
+   * anonymously from the Halcyon Maven repo.
+   */
+  private halcyonBuild(source?: Directory): Container {
+    return dag
+      .container()
+      .from("maven:3.9-eclipse-temurin-25")
+      .withMountedCache("/root/.m2/repository", dag.cacheVolume("halcyon-m2"))
+      .withDirectory("/src", this.halcyonSource(source))
+      .withWorkdir("/src")
+      .withExec([
+        "sh",
+        "-c",
+        "mkdir -p /opt && " +
+          "mvn -q -B -ntp -Dmaven.test.skip=true -pl Halcyon -am package && " +
+          "cp Halcyon/target/Halcyon-*.jar /opt/halcyon.jar",
+      ])
+  }
+
   @func()
   sparqService(source?: Directory): Service {
     const build = dag
