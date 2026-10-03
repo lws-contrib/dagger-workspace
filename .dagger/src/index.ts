@@ -218,6 +218,47 @@ export class DaggerWorkspace {
   }
 
   /**
+   * The rules-harness suite source: the lws-test-suite repo (harness.ts +
+   * package.json/bun.lock + lws10/tests.yaml + lws10/rules.n3) from the `n3`
+   * branch of https://github.com/elf-pavlik/lws-test-suite by default (the
+   * N3-rules + SPARQL manifest format), or a local checkout when an explicit
+   * Directory is passed (e.g. --tests ../lws-test-suite).
+   */
+  private rulesSuite(tests?: Directory): Directory {
+    return (
+      tests ??
+      dag.git("https://github.com/elf-pavlik/lws-test-suite")
+        .branch("n3")
+        .tree()
+    )
+  }
+
+  /**
+   * Runs the N3-rules harness (harness.ts in the suite source) against the
+   * bound service. The suite Directory must contain harness.ts, package.json /
+   * bun.lock and lws10/tests.yaml + lws10/rules.n3; the manifest's input
+   * (param:storage) is bound from LWS_STORAGE.
+   */
+  private rulesRun(
+    suite: Directory,
+    service: Service,
+    host: string,
+    baseUrl: string,
+  ): Promise<string> {
+    return dag
+      .container()
+      .from("oven/bun:1")
+      .withEntrypoint([]) // the oven/bun image defaults its entrypoint to bun
+      .withDirectory("/suite", suite)
+      .withServiceBinding(host, service)
+      .withEnvVariable("LWS_STORAGE", baseUrl)
+      .withWorkdir("/suite")
+      .withExec(["bun", "install"])
+      .withExec(["bun", "harness.ts", "lws10/tests.yaml", "lws10/rules.n3"])
+      .stdout()
+  }
+
+  /**
    * The Halcyon source: the `next` branch of
    * https://github.com/halcyon-project/Halcyon by default (or another GitHub
    * repo/branch via halcyonRepo/halcyonRef), or a local checkout when a source
@@ -410,14 +451,15 @@ export class DaggerWorkspace {
     targetProperties?: Record<string, string>
   } {
     if (server === "halcyon") {
-      // lws-net never sends an Authorization header, so its cell boots Halcyon
-      // in DEV-ONLY open mode (:LWSOpenMode): the seeded root ACR grants the
-      // public agent full control, and anonymous requests provision the
-      // storage. The touchstone cell keeps the closed posture and its harness
-      // reads static LWS-OIDC credentials (webid + ID token) for alice and bob
-      // from the target registry — minted against the in-container OIDC fixture
-      // (see HALCYON_OIDC) — while the owner policy stays the controller.
-      if (harness === "lws-net") {
+      // lws-net/rules never send an Authorization header, so their cells boot
+      // Halcyon in DEV-ONLY open mode (:LWSOpenMode): the seeded root ACR
+      // grants the public agent full control, and anonymous requests provision
+      // the storage. The touchstone cell keeps the closed posture and its
+      // harness reads static LWS-OIDC credentials (webid + ID token) for alice
+      // and bob from the target registry — minted against the in-container
+      // OIDC fixture (see HALCYON_OIDC) — while the owner policy stays the
+      // controller.
+      if (harness === "lws-net" || harness === "rules") {
         return {
           service: this.halcyonService(source, true, halcyonRepo, halcyonRef),
           host: "halcyon",
@@ -462,20 +504,22 @@ export class DaggerWorkspace {
    * CLI:
    *   dagger call test --harness touchstone --server lws-server
    *   dagger call test --harness lws-net --server lws-server
-   *   dagger call test --harness touchstone --server sparq
-   *   dagger call test --harness lws-net --server sparq
-   *   dagger call test --harness touchstone --server halcyon
-   *   dagger call test --harness lws-net --server halcyon
+   *   dagger call test --harness rules --server lws-server
+   *   dagger call test --harness rules --server sparq
+   *   dagger call test --harness rules --server halcyon
    *
    * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
    * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
    * default (converted to N-Triples and mounted as the harness's new.ttl);
-   * force a local copy by passing a relative path:
+   * the rules harness uses harness.ts + the manifest/rules from the `n3`
+   * branch of the same repo by default. Force a local copy for either by
+   * passing a relative path to a checkout:
    *   dagger call test --harness lws-net --server lws-server --tests ../lws-test-suite/lws10
+   *   dagger call test --harness rules --server lws-server --tests ../lws-test-suite
    */
   @func()
   async test(
-    // The suite harness: "touchstone" (default) or "lws-net".
+    // The suite harness: "touchstone" (default), "lws-net" or "rules".
     harness: string = "touchstone",
     // The implementation under test: "lws-server" (default), "sparq" or "halcyon".
     server: string = "lws-server",
@@ -488,10 +532,11 @@ export class DaggerWorkspace {
     halcyonRef?: string,
     // Override the harness source (touchstone / LWS.net repo checkout).
     suite?: Directory,
-    // Suite definition for the lws-net harness: default is tests.yaml from
-    // the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite
-    // (converted to N-Triples new.ttl); pass a relative path to a local
-    // checkout of the lws-test-suite repo to force a local copy instead.
+    // Suite definition: for the lws-net harness it is tests.yaml from the
+    // `yaml` branch of https://github.com/elf-pavlik/lws-test-suite
+    // (converted to N-Triples new.ttl); for the rules harness it is the whole
+    // lws-test-suite checkout (harness.ts + lws10/) from the `n3` branch.
+    // Pass a relative path to a local checkout to force a local copy instead.
     // Touchstone still vendors its own definitions/ and does not consume this.
     tests?: Directory,
   ): Promise<string> {
@@ -511,7 +556,12 @@ export class DaggerWorkspace {
         .withExec(["dotnet", "test", "Suite/Test"])
         .stdout()
     }
-    throw new Error(`unknown harness: ${harness} (expected touchstone or lws-net)`)
+    if (harness === "rules") {
+      // The suite Directory carries harness.ts + the manifest; the storage
+      // input (param:storage) is bound from the service's base URL.
+      return this.rulesRun(this.rulesSuite(tests), service, host, baseUrl)
+    }
+    throw new Error(`unknown harness: ${harness} (expected touchstone, lws-net or rules)`)
   }
 
   /**

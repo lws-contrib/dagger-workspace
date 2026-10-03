@@ -46,7 +46,7 @@ jobs:
       # cell must never cancel the other cells.
       fail-fast: false
       matrix:
-        harness: [touchstone, lws-net]
+        harness: [touchstone, lws-net, rules]
         server: [lws-server, sparq, halcyon]
         # The lws-net x sparq cell is currently red (Solid vs LWS surface). The
         # halcyon cells boot differently per harness: touchstone keeps the
