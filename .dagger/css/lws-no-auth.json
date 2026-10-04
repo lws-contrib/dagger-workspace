@@ -1,0 +1,50 @@
+{
+  "@context": "https://linkedsoftwaredependencies.org/bundles/npm/@solid/community-server/^7.0.0/components/context.jsonld",
+  "import": [
+    "css:config/app/init/default.json",
+    "css:config/app/main/default.json",
+    "css:config/app/variables/default.json",
+    "css:config/http/handler/lws.json",
+    "css:config/http/middleware/default.json",
+    "css:config/http/notifications/disabled.json",
+    "css:config/http/server-factory/http.json",
+    "css:config/http/static/default.json",
+    "css:config/identity/access/public.json",
+    "css:config/identity/email/default.json",
+    "css:config/identity/handler/no-accounts.json",
+    "css:config/identity/lws/default.json",
+    "css:config/identity/oidc/default.json",
+    "css:config/identity/ownership/token.json",
+    "css:config/identity/pod/static.json",
+    "css:config/ldp/authentication/lws.json",
+    "css:config/ldp/authorization/allow-all.json",
+    "css:config/ldp/handler/lws.json",
+    "css:config/ldp/metadata-parser/lws.json",
+    "css:config/ldp/metadata-writer/lws.json",
+    "css:config/ldp/modes/lws.json",
+    "css:config/storage/backend/file.json",
+    "css:config/storage/key-value/resource-store.json",
+    "css:config/storage/location/root.json",
+    "css:config/storage/middleware/lws.json",
+    "css:config/util/auxiliary/acl.json",
+    "css:config/util/identifiers/suffix.json",
+    "css:config/util/index/default.json",
+    "css:config/util/logging/winston.json",
+    "css:config/util/representation-conversion/lws.json",
+    "css:config/util/resource-locker/file.json",
+    "css:config/util/variables/default.json"
+  ],
+  "@graph": [
+    {
+      "comment": [
+        "DEV/TEST ONLY, DO NOT USE IN PRODUCTION.",
+        "A Linked Web Storage (LWS-only) CommunitySolidServer posture used by the conformance",
+        "workspace: a single storage rooted at the server base URL (storage/location/root.json",
+        "plus identity/pod/static.json), authorization disabled entirely (allow-all.json), and",
+        "no accounts. Served on top of the LWS config pieces of the feat/lws branch.",
+        "app/init/default.json (not static-root.json) is intentional: the static asset handler",
+        "ignores Accept and would otherwise shadow the storage description on GET /."
+      ]
+    }
+  ]
+}

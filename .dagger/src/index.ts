@@ -3,11 +3,12 @@
  * (https://github.com/lws-contrib/dagger-workspace).
  *
  * Builds the lws-server (https://github.com/ebremer/lws-server), sparq
- * (https://github.com/sparq-org/sparq) and Halcyon
- * (https://github.com/halcyon-project/Halcyon, `next` branch) implementations
- * under test and runs the Touchstone (https://github.com/ebremer/touchstone) or
- * LWS.net (https://github.com/langsamu/LWS.net) conformance harnesses against
- * them.
+ * (https://github.com/sparq-org/sparq), Halcyon
+ * (https://github.com/halcyon-project/Halcyon, `next` branch) and
+ * CommunitySolidServer (https://github.com/jeswr/CommunitySolidServer,
+ * `feat/lws` branch) implementations under test and runs the Touchstone
+ * (https://github.com/ebremer/touchstone) or LWS.net
+ * (https://github.com/langsamu/LWS.net) conformance harnesses against them.
  *
  * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
  * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
@@ -281,6 +282,28 @@ export class DaggerWorkspace {
   }
 
   /**
+   * The CommunitySolidServer source: a GitHub clone of the LWS fork
+   * https://github.com/jeswr/CommunitySolidServer (`feat/lws` branch by
+   * default), or a local checkout (e.g. ../CommunitySolidServer) when a source
+   * Directory is passed explicitly.
+   */
+  private cssSource(
+    source?: Directory,
+    cssRepo?: string,
+    cssRef?: string,
+  ): Directory {
+    return (
+      source ??
+      dag
+        .git(cssRepo && cssRepo.trim() !== ""
+          ? cssRepo
+          : "https://github.com/jeswr/CommunitySolidServer")
+        .branch(cssRef && cssRef.trim() !== "" ? cssRef : "feat/lws")
+        .tree()
+    )
+  }
+
+  /**
    * Builds the lws-server (Maven / Spring Boot, JDK 25) from source into a
    * container image. Dependencies are cached in a cache volume.
    */
@@ -444,6 +467,8 @@ export class DaggerWorkspace {
     source?: Directory,
     halcyonRepo?: string,
     halcyonRef?: string,
+    cssRepo?: string,
+    cssRef?: string,
   ): {
     service: Service
     host: string
@@ -492,8 +517,26 @@ export class DaggerWorkspace {
         baseUrl: "http://lws-server:8080/",
       }
     }
+    if (server === "css") {
+      // CommunitySolidServer boots with authorization disabled (allow-all) and
+      // a single storage at the base URL, so every harness can be pointed at it
+      // with no credentials. Touchstone's core reads ${identity.bob.webid}
+      // (access-grant / storage-authorization tests use it purely as an IRI);
+      // token.* is deliberately absent: with no Authentication capability in
+      // the target the `as:` identities send no Authorization header and every
+      // authz/fault test is inapplicable.
+      return {
+        service: this.cssService(source, cssRepo, cssRef),
+        host: "css",
+        baseUrl: "http://css:3000/",
+        targetProperties: {
+          "webid.alice": "http://css:3000/alice",
+          "webid.bob": "http://css:3000/bob",
+        },
+      }
+    }
     throw new Error(
-      `unknown server: ${server} (expected lws-server, sparq or halcyon)`,
+      `unknown server: ${server} (expected lws-server, sparq, halcyon or css)`,
     )
   }
 
@@ -507,6 +550,9 @@ export class DaggerWorkspace {
    *   dagger call test --harness rules --server lws-server
    *   dagger call test --harness rules --server sparq
    *   dagger call test --harness rules --server halcyon
+   *   dagger call test --harness touchstone --server css --source ../CommunitySolidServer
+   *   dagger call test --harness lws-net --server css
+   *   dagger call test --harness rules --server css
    *
    * The lws-net harness uses the YAML-LD suite definition (tests.yaml) from
    * the `yaml` branch of https://github.com/elf-pavlik/lws-test-suite by
@@ -530,6 +576,11 @@ export class DaggerWorkspace {
     halcyonRepo?: string,
     // Halcyon only: the branch/ref of halcyonRepo (default: next).
     halcyonRef?: string,
+    // CommunitySolidServer only: the GitHub repo to build from when no local
+    // --source is given (default: jeswr/CommunitySolidServer, the LWS fork).
+    cssRepo?: string,
+    // CommunitySolidServer only: the branch/ref of cssRepo (default: feat/lws).
+    cssRef?: string,
     // Override the harness source (touchstone / LWS.net repo checkout).
     suite?: Directory,
     // Suite definition: for the lws-net harness it is tests.yaml from the
@@ -541,7 +592,7 @@ export class DaggerWorkspace {
     tests?: Directory,
   ): Promise<string> {
     const { service, host, baseUrl, targetProperties } =
-      this.sut(server, harness, source, halcyonRepo, halcyonRef)
+      this.sut(server, harness, source, halcyonRepo, halcyonRef, cssRepo, cssRef)
     if (harness === "touchstone") {
       return this.touchstoneRun(service, host, baseUrl, targetProperties, suite)
     }
@@ -738,6 +789,73 @@ export class DaggerWorkspace {
         'echo "halcyon maven build failed (attempt $i of 5); retrying in $((i * 30))s"; ' +
         "sleep $((i * 30)); done; exit 1",
     ])
+  }
+
+  /**
+   * Builds the CommunitySolidServer (npm: tsc + componentsjs-generator) into a
+   * container image, overlaying this module's no-auth LWS config
+   * (css/lws-no-auth.json) onto the source at config/lws-no-auth.json. npm
+   * downloads are cached in a cache volume.
+   */
+  private cssBuild(
+    source?: Directory,
+    cssRepo?: string,
+    cssRef?: string,
+  ): Container {
+    return dag
+      .container()
+      .from("node:22-alpine")
+      .withMountedCache("/root/.npm", dag.cacheVolume("css-npm"))
+      .withDirectory("/src", this.cssSource(source, cssRepo, cssRef))
+      .withFile(
+        "/src/config/lws-no-auth.json",
+        dag.currentModule().source().file("css/lws-no-auth.json"),
+      )
+      .withWorkdir("/src")
+      // npm ci already runs the prepare script (npm run build); the second
+      // build is an idempotent safety net.
+      .withExec(["npm", "ci", "--unsafe-perm"])
+      .withExec(["npm", "run", "build"])
+  }
+
+  /**
+   * Builds and starts the CommunitySolidServer LWS fork
+   * (https://github.com/jeswr/CommunitySolidServer, `feat/lws` branch), served
+   * as a Dagger service bound as "css" on port 3000.
+   *
+   * Booted from the module-owned css/lws-no-auth.json config (written over the
+   * source at config/lws-no-auth.json): LWS-only protocol handlers, a SINGLE
+   * storage rooted at the base URL (storage/location/root.json with the static
+   * pod manager, so the whole storage is http://css:3000/), no accounts/IDP,
+   * and authorization disabled entirely (ldp/authorization/allow-all.json -
+   * every operation is allowed, no tokens needed). The harnesses can therefore
+   * be pointed straight at the base URL; touchstone's `as:` identities send no
+   * Authorization header (the target declares no Authentication capability)
+   * and its authz/fault tests go inapplicable.
+   *
+   * The source defaults to the `feat/lws` branch of jeswr's fork; pass
+   * --source with a local checkout (e.g. ../CommunitySolidServer) to test
+   * uncommitted changes, or --css-repo/--css-ref for a different fork/branch.
+   */
+  @func()
+  cssService(
+    source?: Directory,
+    cssRepo?: string,
+    cssRef?: string,
+  ): Service {
+    return this.cssBuild(source, cssRepo, cssRef)
+      .withExec(["mkdir", "-p", "/data"])
+      .withExposedPort(3000)
+      .asService({
+        args: [
+          "node", "bin/server.js",
+          "-c", "config/lws-no-auth.json",
+          "-b", "http://css:3000",
+          "-f", "/data",
+          "-p", "3000",
+        ],
+      })
+      .withHostname("css")
   }
 
   @func()
