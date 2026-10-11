@@ -190,8 +190,8 @@ export class DaggerWorkspace {
     return (
       source ??
       dag
-        .git("https://github.com/elf-pavlik/sparq")
-        .branch("feat/open-mode")
+        .git("https://github.com/sparq-org/sparq")
+        .branch("main")
         .tree()
     )
   }
@@ -556,14 +556,12 @@ export class DaggerWorkspace {
    * workspace, https://github.com/sparq-org/sparq), returned as a Dagger
    * service bound as "sparq" on port 3000.
    *
-   * Serves an ephemeral in-memory store (PSS_SPARQ_BACKEND default) in open mode:
-   * SOLID_SERVER_OPEN_MODE=1 (a dev seed on the feat/open-mode branch) grants the
-   * public foaf:Agent Read/Write/Append/Control on the storage root, so anonymous
-   * clients can provision and write.
+   * Serves the LWS protocol (SOLID_SERVER_PROTOCOL=lws) over an ephemeral
+   * in-memory store in open mode (SOLID_SERVER_OPEN_MODE=1: no authentication),
+   * so anonymous clients can provision and write.
    *
-   * The source defaults to the feat/open-mode branch of the
-   * https://github.com/elf-pavlik/sparq fork; pass --source with a local checkout
-   * to test uncommitted changes.
+   * The source defaults to the main branch of https://github.com/sparq-org/sparq;
+   * pass --source with a local checkout to test uncommitted changes.
    */
   /**
    * Builds and starts the W3C Linked Web Storage server embedded in Halcyon
@@ -706,6 +704,7 @@ export class DaggerWorkspace {
       .withExec(["cargo", "build", "-p", "sparq-lws-core"])
     return build
       .withExposedPort(3000)
+      .withEnvVariable("SOLID_SERVER_PROTOCOL", "lws")
       .withEnvVariable("SOLID_SERVER_BIND", "0.0.0.0:3000")
       .withEnvVariable("SOLID_SERVER_BASE_URL", "http://sparq:3000")
       .withEnvVariable("SOLID_SERVER_OPEN_MODE", "1")
